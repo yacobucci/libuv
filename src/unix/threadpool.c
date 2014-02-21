@@ -34,11 +34,16 @@ static QUEUE exit_message;
 static QUEUE wq;
 static volatile int initialized;
 
+static uv_barrier_t fork_barrier;
+static uv_mutex_t fork_lock;
+static int do_fork_guard;
+
+static void fork_guard(void);
+static void init_fork_protection(int);
 
 static void uv__cancelled(struct uv__work* w) {
   abort();
 }
-
 
 /* To avoid deadlock with uv_cancel() it's crucial that the worker
  * never holds the global mutex and the loop-local mutex at the same time.
@@ -50,6 +55,10 @@ static void worker(void* arg) {
   (void) arg;
 
   for (;;) {
+    if (do_fork_guard) {
+      fork_guard();
+    }
+
     uv_mutex_lock(&mutex);
 
     while (QUEUE_EMPTY(&wq))
@@ -82,6 +91,84 @@ static void worker(void* arg) {
   }
 }
 
+static void fork_guard(void) {
+  // give all the worker threads time to get to the same place
+  uv_barrier_wait(&fork_barrier);
+
+  // wait for the fork to occur
+  uv_mutex_lock(&fork_lock);
+  // since we were just waiting for the fork now release the resource and go
+  uv_mutex_unlock(&fork_lock);
+}
+
+static void seed_work_cb(uv_work_t *data) {
+}
+
+static void after_work_cb(uv_work_t *data, int status) {
+  free(data);
+}
+
+static void prepare_fork(void) {
+  assert(1 == initialized);
+  assert(0 == do_fork_guard);
+
+  // tell the threads to start getting ready to fork
+  do_fork_guard = 1;
+
+  if (QUEUE_EMPTY(&wq)) {
+    // seed nthreads jobs to spin up threads
+    int i = 0;
+    for(; i < nthreads; ++i) {
+      uv_work_t *req = malloc(sizeof(uv_work_t));
+      uv_queue_work(uv_default_loop(), req, &seed_work_cb, &after_work_cb);
+    }
+  }
+  // lock now so when the barrier hits we know the threads will halt
+  uv_mutex_lock(&fork_lock);
+  // wait for the threads to get here
+  uv_barrier_wait(&fork_barrier);
+}
+
+static void parent_process(void) {
+  assert(1 == initialized);
+  assert(1 == do_fork_guard);
+
+  // the parent threads can go and do what they want to do
+  do_fork_guard = 0;
+  // let them move on with life
+  uv_mutex_unlock(&fork_lock);
+}
+
+static void child_process(void) {
+  assert(1 == initialized);
+  assert(1 == do_fork_guard);
+
+  // set the guard to 0 so the newly spun up threads don't wait in the barrier
+  // and deadlock
+  do_fork_guard = 0;
+  uv_mutex_unlock(&fork_lock);
+
+  // our state will say we're initialized, so let's make it a reality for the
+  // child
+  int i;
+  for (i = 0; i < nthreads; i++) {
+    if (uv_thread_create(threads + i, worker, NULL)) {
+      abort();
+    }
+  }
+}
+
+void init_fork_protection(int num_threads) {
+  do_fork_guard = 0;
+  // init the fork to num_threads, plus the main thread
+  if (uv_barrier_init(&fork_barrier, num_threads + 1))
+    abort();
+  if (uv_mutex_init(&fork_lock))
+    abort();
+  // register the fork functions
+  if (pthread_atfork(&prepare_fork, &parent_process, &child_process))
+    abort();
+}
 
 static void post(QUEUE* q) {
   uv_mutex_lock(&mutex);
@@ -120,6 +207,8 @@ static void init_once(void) {
     abort();
 
   QUEUE_INIT(&wq);
+
+  init_fork_protection(nthreads);
 
   for (i = 0; i < nthreads; i++)
     if (uv_thread_create(threads + i, worker, NULL))
